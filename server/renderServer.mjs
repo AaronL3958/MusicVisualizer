@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import ffmpegPath from "ffmpeg-static";
 import FFT from "fft.js";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
+import { createVisualizerCore } from "../shared/visualizerCore.mjs";
 
 const app = express();
 const upload = multer({ dest: path.join(os.tmpdir(), "spectrum-studio-uploads") });
@@ -212,6 +213,7 @@ class BackendRenderer {
     this.pcm = pcm;
     this.canvas = createCanvas(width, height);
     this.ctx = this.canvas.getContext("2d");
+    this.core = createVisualizerCore(this.canvas);
     this.fft = new FFT(FFT_SIZE);
     this.fftInput = new Array(FFT_SIZE).fill(0);
     this.fftOutput = this.fft.createComplexArray();
@@ -233,7 +235,7 @@ class BackendRenderer {
     const fade = getFadeLevel(time, duration, this.settings.fadeIn ?? 0, this.settings.fadeOut ?? 0);
     metrics.bass *= fade;
     metrics.bassPulse *= fade;
-    this.draw(metrics, time);
+    this.core.drawFrame(this.settings, metrics, { logo: this.logo, background: this.background }, time);
     return this.canvas.encodeSync("png");
   }
 
@@ -677,6 +679,7 @@ function hexToRgba(hex, alpha) {
   const b = value & 255;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
+
 
 
 
