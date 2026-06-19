@@ -265,7 +265,7 @@ class BackendRenderer {
     this.lastBass = 0;
     this.pulse = 0;
     this.kickCooldown = 0;
-    this.particles = makeTunnelParticles(140);
+    this.particles = makeTunnelParticles(90);
   }
 
   renderFrame(time, duration) {
@@ -374,13 +374,16 @@ class BackendRenderer {
     }
     ctx.fillStyle = `rgba(0,0,0,${s.darkOverlay ?? 0.45})`;
     ctx.fillRect(0, 0, w, h);
-    this.drawTunnelParticles(ctx, metrics, time, cx, cy, min);
+    if (s.particles) this.drawTunnelParticles(ctx, metrics, time, cx, cy, min);
 
     ctx.translate(cx, cy);
     ctx.globalCompositeOperation = "lighter";
     this.drawOuterGlow(ctx, metrics, min);
-    this.drawCircularSpectrum(ctx, metrics, min);
-    if (s.waveform) this.drawWaveformRing(ctx, metrics, min);
+    if (s.style === "bars") this.drawHorizontalBars(ctx, metrics, w, min);
+    if (s.style === "waveform") this.drawWaveformRing(ctx, metrics, min, 0.82);
+    if (s.style === "particles") this.drawParticlePulse(ctx, metrics, min, time);
+    if (!s.style || s.style === "circular") this.drawCircularSpectrum(ctx, metrics, min);
+    if (s.waveform && s.style !== "waveform") this.drawWaveformRing(ctx, metrics, min, 0.45);
     ctx.globalCompositeOperation = "source-over";
     this.drawLogo(ctx, metrics, min);
     ctx.restore();
@@ -389,7 +392,7 @@ class BackendRenderer {
   drawCircularSpectrum(ctx, metrics, min) {
     const s = this.settings;
     const bins = metrics.frequencyData;
-    const count = 224;
+    const count = 192;
     const radius = min * (s.spectrumRadius ?? 0.27) * (1 + metrics.bassPulse * 0.055);
     const maxBar = min * (s.barHeight ?? 0.22);
     ctx.save();
@@ -417,12 +420,12 @@ class BackendRenderer {
     ctx.restore();
   }
 
-  drawWaveformRing(ctx, metrics, min) {
+  drawWaveformRing(ctx, metrics, min, alpha = 0.82) {
     const s = this.settings;
     const radius = min * ((s.spectrumRadius ?? 0.27) + 0.06);
     ctx.save();
     ctx.strokeStyle = s.secondaryColor ?? "#ff3df2";
-    ctx.globalAlpha = 0.38;
+    ctx.globalAlpha = alpha;
     ctx.lineWidth = Math.max(2, min * 0.003);
     ctx.shadowColor = s.secondaryColor ?? "#ff3df2";
     ctx.shadowBlur = min * 0.02 * (s.glowAmount ?? 0.9);
@@ -440,6 +443,48 @@ class BackendRenderer {
     ctx.restore();
   }
 
+  drawHorizontalBars(ctx, metrics, width, min) {
+    const s = this.settings;
+    const bins = metrics.frequencyData;
+    const bars = 96;
+    const span = width * 0.76;
+    const barWidth = span / bars;
+    const maxHeight = min * (s.barHeight ?? 0.22) * 0.65;
+    ctx.save();
+    ctx.shadowColor = s.glowColor ?? "#78ffdb";
+    ctx.shadowBlur = min * 0.03 * (s.glowAmount ?? 0.9);
+    for (let side = -1; side <= 1; side += 2) {
+      for (let i = 0; i < bars; i += 1) {
+        const bin = Math.floor((i / bars) * bins.length * 0.72);
+        const value = Math.pow((bins[bin] ?? 0) / 255, 1.22);
+        const h = maxHeight * (0.08 + value + metrics.bass * 0.2);
+        const x = -span / 2 + i * barWidth;
+        ctx.fillStyle = i % 2 ? s.primaryColor ?? "#35f2ff" : s.secondaryColor ?? "#ff3df2";
+        ctx.globalAlpha = 0.72;
+        ctx.fillRect(x, side * (min * 0.22), barWidth * 0.56, side * h);
+      }
+    }
+    ctx.restore();
+  }
+
+  drawParticlePulse(ctx, metrics, min, time) {
+    const s = this.settings;
+    const radius = min * (s.spectrumRadius ?? 0.27) * (1.1 + metrics.bassPulse * 0.2);
+    ctx.save();
+    ctx.globalAlpha = 0.75;
+    ctx.shadowColor = s.glowColor ?? "#78ffdb";
+    ctx.shadowBlur = min * 0.03 * (s.glowAmount ?? 0.9);
+    for (let i = 0; i < 160; i += 1) {
+      const angle = (i / 160) * Math.PI * 2 + time * 0.04;
+      const wave = Math.sin(i * 0.17 + time * 2.2) * min * 0.018;
+      const r = radius + wave + ((metrics.frequencyData[i % metrics.frequencyData.length] ?? 0) / 255) * min * 0.12;
+      ctx.fillStyle = i % 3 ? s.primaryColor ?? "#35f2ff" : s.secondaryColor ?? "#ff3df2";
+      ctx.beginPath();
+      ctx.arc(Math.cos(angle) * r, Math.sin(angle) * r, min * 0.0035, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
   drawOuterGlow(ctx, metrics, min) {
     const s = this.settings;
     const radius = min * (s.spectrumRadius ?? 0.27) * (1 + metrics.bassPulse * 0.12);
@@ -487,19 +532,20 @@ class BackendRenderer {
     ctx.translate(cx, cy);
     ctx.globalCompositeOperation = "lighter";
     for (const p of this.particles) {
-      const z = (p.z - (time * p.speed + metrics.bassPulse * 0.28)) % 1;
-      const depth = z < 0 ? z + 1 : z;
+      const depthRaw = (p.radius - (time * p.speed * 0.12 + metrics.bassPulse * 0.08)) % 1;
+      const depth = depthRaw < 0 ? depthRaw + 1 : depthRaw;
       const spread = Math.pow(depth, 1.85);
-      const r = min * p.radius * spread;
+      const r = min * (0.18 + spread * 0.68);
       const x = Math.cos(p.angle) * r;
       const y = Math.sin(p.angle) * r;
-      const alpha = (1 - depth) * p.alpha * (0.35 + metrics.bassPulse * 0.9);
-      ctx.globalAlpha = alpha;
-      ctx.strokeStyle = p.warm ? this.settings.secondaryColor ?? "#ff3df2" : this.settings.primaryColor ?? "#35f2ff";
-      ctx.lineWidth = Math.max(1, min * p.size * (1.2 - depth));
+      const tailX = Math.cos(p.angle) * r * 0.84;
+      const tailY = Math.sin(p.angle) * r * 0.84;
+      ctx.globalAlpha = (1 - depth) * p.alpha * (0.35 + metrics.bassPulse * 0.9);
+      ctx.strokeStyle = p.angle % 2 > 1 ? this.settings.primaryColor ?? "#35f2ff" : this.settings.secondaryColor ?? "#ff3df2";
+      ctx.lineWidth = Math.max(1, p.size * min * (1.25 - depth));
       ctx.beginPath();
       ctx.moveTo(x, y);
-      ctx.lineTo(x * 0.86, y * 0.86);
+      ctx.lineTo(tailX, tailY);
       ctx.stroke();
     }
     ctx.restore();
@@ -550,15 +596,16 @@ function getFadeLevel(time, duration, fadeIn, fadeOut) {
 }
 
 function makeTunnelParticles(count) {
-  return Array.from({ length: count }, (_, i) => ({
-    angle: pseudoRandom(i + 1) * Math.PI * 2,
-    radius: 0.18 + pseudoRandom(i + 2) * 0.86,
-    z: pseudoRandom(i + 3),
-    speed: 0.12 + pseudoRandom(i + 4) * 0.2,
-    size: 0.0015 + pseudoRandom(i + 5) * 0.0035,
-    alpha: 0.18 + pseudoRandom(i + 6) * 0.7,
-    warm: pseudoRandom(i + 7) > 0.5
-  }));
+  return Array.from({ length: count }, (_, i) => {
+    const n = pseudoRandom(i + 11);
+    return {
+      angle: pseudoRandom(i + 1) * Math.PI * 2,
+      radius: 0.22 + pseudoRandom(i + 2) * 0.58,
+      speed: 0.01 + pseudoRandom(i + 3) * 0.035,
+      size: 0.0016 + n * 0.0035,
+      alpha: 0.18 + pseudoRandom(i + 4) * 0.52
+    };
+  });
 }
 
 function pseudoRandom(seed) {
@@ -582,4 +629,7 @@ function hexToRgba(hex, alpha) {
   const b = value & 255;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
+
+
+
 
