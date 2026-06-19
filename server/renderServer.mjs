@@ -6,6 +6,7 @@ import fssync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import ffmpegPath from "ffmpeg-static";
 import FFT from "fft.js";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
@@ -18,6 +19,151 @@ const FFT_SIZE = 2048;
 
 app.use(cors({ origin: true }));
 app.get("/api/health", (_req, res) => res.json({ ok: true, renderer: "ffmpeg-backend" }));
+const jobs = new Map();
+
+app.post("/api/render-job", upload.fields([
+  { name: "audio", maxCount: 1 },
+  { name: "logo", maxCount: 1 },
+  { name: "background", maxCount: 1 }
+]), async (req, res) => {
+  const files = req.files ?? {};
+  const audioFile = files.audio?.[0];
+  const logoFile = files.logo?.[0];
+  const backgroundFile = files.background?.[0];
+  if (!audioFile) return res.status(400).json({ error: "Audio file is required." });
+
+  const jobId = randomUUID();
+  const job = {
+    id: jobId,
+    status: "queued",
+    progress: 0,
+    frame: 0,
+    totalFrames: 0,
+    message: "Queued render job.",
+    outputPath: null,
+    tmpDir: null,
+    filename: null,
+    error: null
+  };
+  jobs.set(jobId, job);
+  res.json({ jobId });
+
+  runRenderJob(job, req.body, audioFile, logoFile, backgroundFile).catch((error) => {
+    job.status = "error";
+    job.error = error instanceof Error ? error.message : "Backend render failed.";
+    job.message = job.error;
+    cleanup([job.tmpDir, audioFile, logoFile, backgroundFile]);
+  });
+});
+
+app.get("/api/render-job/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Render job not found." });
+  res.json({
+    id: job.id,
+    status: job.status,
+    progress: job.progress,
+    frame: job.frame,
+    totalFrames: job.totalFrames,
+    message: job.message,
+    filename: job.filename,
+    error: job.error
+  });
+});
+
+app.get("/api/render-job/:jobId/download", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Render job not found." });
+  if (job.status !== "done" || !job.outputPath) return res.status(409).json({ error: "Render job is not complete yet." });
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", `attachment; filename="${job.filename}"`);
+  fssync.createReadStream(job.outputPath).pipe(res);
+  res.on("finish", () => {
+    cleanup([job.tmpDir]);
+    jobs.delete(job.id);
+  });
+});
+
+async function runRenderJob(job, body, audioFile, logoFile, backgroundFile) {
+  const settings = JSON.parse(body.settings ?? "{}");
+  const width = Number(body.width ?? 2560);
+  const height = Number(body.height ?? 1440);
+  const fps = Number(body.fps ?? 60);
+  const durationLimit = Number(body.durationLimit ?? 0);
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "spectrum-studio-render-"));
+  const outPath = path.join(tmpDir, "visualizer.mp4");
+  job.tmpDir = tmpDir;
+  job.filename = `spectrum-studio-${width}x${height}-${fps}fps.mp4`;
+
+  job.status = "decoding";
+  job.progress = 0.02;
+  job.message = "Decoding audio.";
+  const pcm = await decodeAudio(audioFile.path);
+  const duration = durationLimit > 0 ? Math.min(durationLimit, pcm.length / SAMPLE_RATE) : pcm.length / SAMPLE_RATE;
+  const totalFrames = Math.max(1, Math.ceil(duration * fps));
+  job.totalFrames = totalFrames;
+
+  job.status = "preparing";
+  job.progress = 0.04;
+  job.message = "Loading render assets.";
+  const logo = logoFile ? await loadImage(logoFile.path) : undefined;
+  const background = backgroundFile ? await loadImage(backgroundFile.path) : undefined;
+  const renderer = new BackendRenderer(width, height, settings, logo, background, pcm);
+
+  const ffmpeg = spawn(ffmpegPath, [
+    "-y",
+    "-hide_banner",
+    "-loglevel", "error",
+    "-f", "image2pipe",
+    "-framerate", String(fps),
+    "-i", "pipe:0",
+    "-i", audioFile.path,
+    "-t", duration.toFixed(3),
+    "-map", "0:v:0",
+    "-map", "1:a:0",
+    "-c:v", "libx264",
+    "-preset", "medium",
+    "-crf", "18",
+    "-pix_fmt", "yuv420p",
+    "-profile:v", "high",
+    "-level", width >= 2560 && fps >= 60 ? "5.2" : "4.2",
+    "-movflags", "+faststart",
+    "-c:a", "aac",
+    "-b:a", "320k",
+    "-shortest",
+    outPath
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+
+  let ffmpegError = "";
+  ffmpeg.stderr.on("data", (chunk) => { ffmpegError += chunk.toString(); });
+
+  job.status = "rendering";
+  job.message = `Rendering frame 0 / ${totalFrames}.`;
+  for (let frame = 0; frame < totalFrames; frame += 1) {
+    const time = frame / fps;
+    const png = renderer.renderFrame(time, duration);
+    if (!ffmpeg.stdin.write(png)) await onceDrain(ffmpeg.stdin);
+    job.frame = frame + 1;
+    job.progress = 0.05 + ((frame + 1) / totalFrames) * 0.9;
+    if (frame % Math.max(1, Math.floor(fps / 2)) === 0 || frame + 1 === totalFrames) {
+      job.message = `Rendering frame ${frame + 1} / ${totalFrames}.`;
+    }
+  }
+  ffmpeg.stdin.end();
+
+  job.status = "encoding";
+  job.progress = 0.97;
+  job.message = "Finalizing MP4.";
+  const code = await waitForExit(ffmpeg);
+  if (code !== 0) throw new Error(ffmpegError || `FFmpeg exited with code ${code}`);
+
+  cleanup([audioFile, logoFile, backgroundFile]);
+  job.status = "done";
+  job.progress = 1;
+  job.outputPath = outPath;
+  job.message = "Render complete.";
+}
 
 app.post("/api/render", upload.fields([
   { name: "audio", maxCount: 1 },
@@ -436,3 +582,4 @@ function hexToRgba(hex, alpha) {
   const b = value & 255;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
+

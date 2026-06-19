@@ -150,7 +150,7 @@ export function App() {
     exportCancelRef.current = () => controller.abort();
     setExportProgress({ status: "recording", progress: 0.02, message: `Backend rendering ${resolutionMap[resolution].label} at ${fps} FPS. This may take a while, but it should be smooth.` });
 
-    startBackendExport({ audio, settings, resolution, fps, logo: uploadFilesRef.current.logo, background: uploadFilesRef.current.background, signal: controller.signal })
+    startBackendExport({ audio, settings, resolution, fps, logo: uploadFilesRef.current.logo, background: uploadFilesRef.current.background, signal: controller.signal, onProgress: setExportProgress })
       .then((result) => {
         setExportProgress({
           status: "done",
@@ -357,37 +357,71 @@ async function startBackendExport(params: {
   logo?: File;
   background?: File;
   signal: AbortSignal;
+  onProgress: (progress: ExportProgress) => void;
 }) {
   const form = new FormData();
   const size = resolutionMap[params.resolution];
   form.append("audio", params.audio.file, params.audio.file.name);
   if (params.logo) form.append("logo", params.logo, params.logo.name);
-  if (params.background) form.append("background", params.background, params.background.name);
+  if (params.background) form.append("background", params.background.name ? params.background : params.background, params.background.name);
   form.append("settings", JSON.stringify(params.settings));
   form.append("width", String(size.width));
   form.append("height", String(size.height));
   form.append("fps", String(params.fps));
 
-  const response = await fetch("http://127.0.0.1:8787/api/render", {
+  const startResponse = await fetch("http://127.0.0.1:8787/api/render-job", {
     method: "POST",
     body: form,
     signal: params.signal
   });
 
-  if (!response.ok) {
-    let message = "Backend render failed.";
-    try {
-      const payload = await response.json();
-      if (payload?.error) message = payload.error;
-    } catch {
-      // Non-JSON error body.
-    }
-    throw new Error(message);
+  if (!startResponse.ok) throw new Error(await readBackendError(startResponse));
+  const { jobId } = await startResponse.json();
+  let filename = `spectrum-studio-${size.width}x${size.height}-${params.fps}fps.mp4`;
+
+  while (true) {
+    await delay(700, params.signal);
+    const statusResponse = await fetch(`http://127.0.0.1:8787/api/render-job/${jobId}`, { signal: params.signal });
+    if (!statusResponse.ok) throw new Error(await readBackendError(statusResponse));
+    const status = await statusResponse.json();
+    filename = status.filename ?? filename;
+
+    params.onProgress({
+      status: status.status === "done" ? "finalizing" : "recording",
+      progress: Math.max(0.02, Math.min(1, Number(status.progress ?? 0))),
+      message: status.message ?? "Backend render is running."
+    });
+
+    if (status.status === "error") throw new Error(status.error ?? "Backend render failed.");
+    if (status.status === "done") break;
   }
 
-  const blob = await response.blob();
+  const downloadResponse = await fetch(`http://127.0.0.1:8787/api/render-job/${jobId}/download`, { signal: params.signal });
+  if (!downloadResponse.ok) throw new Error(await readBackendError(downloadResponse));
+  const blob = await downloadResponse.blob();
   return {
     url: URL.createObjectURL(blob),
-    filename: `spectrum-studio-${size.width}x${size.height}-${params.fps}fps.mp4`
+    filename
   };
 }
+
+async function readBackendError(response: Response) {
+  try {
+    const payload = await response.json();
+    if (payload?.error) return payload.error;
+  } catch {
+    // Non-JSON error body.
+  }
+  return "Backend render failed.";
+}
+
+function delay(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    const timeout = window.setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => {
+      window.clearTimeout(timeout);
+      reject(new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  });
+}
+
