@@ -114,7 +114,7 @@ async function runRenderJob(job, body, audioFile, logoFile, backgroundFile) {
   const background = backgroundFile ? await loadImage(backgroundFile.path) : undefined;
   const renderer = new BackendRenderer(width, height, settings, logo, background, pcm);
 
-  const ffmpeg = spawn(ffmpegPath, buildFfmpegArgs({ width, fps, duration, audioPath: audioFile.path, outPath }), { stdio: ["pipe", "pipe", "pipe"] });
+  const ffmpeg = spawn(ffmpegPath, buildFfmpegArgs({ width, fps, duration, audioPath: audioFile.path, outPath, settings }), { stdio: ["pipe", "pipe", "pipe"] });
 
   let ffmpegError = "";
   ffmpeg.stderr.on("data", (chunk) => { ffmpegError += chunk.toString(); });
@@ -173,7 +173,7 @@ app.post("/api/render", upload.fields([
     const background = backgroundFile ? await loadImage(backgroundFile.path) : undefined;
     const renderer = new BackendRenderer(width, height, settings, logo, background, pcm);
 
-    const ffmpeg = spawn(ffmpegPath, buildFfmpegArgs({ width, fps, duration, audioPath: audioFile.path, outPath }), { stdio: ["pipe", "pipe", "pipe"] });
+    const ffmpeg = spawn(ffmpegPath, buildFfmpegArgs({ width, fps, duration, audioPath: audioFile.path, outPath, settings }), { stdio: ["pipe", "pipe", "pipe"] });
 
     let ffmpegError = "";
     ffmpeg.stderr.on("data", (chunk) => { ffmpegError += chunk.toString(); });
@@ -216,6 +216,7 @@ class BackendRenderer {
     this.fftInput = new Array(FFT_SIZE).fill(0);
     this.fftOutput = this.fft.createComplexArray();
     this.frequencyData = new Uint8Array(FFT_SIZE / 2);
+    this.smoothFrequencyData = new Float32Array(FFT_SIZE / 2);
     this.waveformData = new Uint8Array(FFT_SIZE);
     this.smoothBass = 0;
     this.slowBass = 0;
@@ -250,8 +251,11 @@ class BackendRenderer {
     for (let i = 0; i < this.frequencyData.length; i += 1) {
       const re = this.fftOutput[i * 2] ?? 0;
       const im = this.fftOutput[i * 2 + 1] ?? 0;
-      const mag = Math.sqrt(re * re + im * im) / 18;
-      this.frequencyData[i] = Math.max(0, Math.min(255, Math.round(mag * 255)));
+      const magnitude = Math.sqrt(re * re + im * im) / (FFT_SIZE / 2);
+      const db = 20 * Math.log10(Math.max(magnitude, 1e-8));
+      const target = clamp((db - (-100)) / ((-30) - (-100)), 0, 1) * 255;
+      this.smoothFrequencyData[i] = this.smoothFrequencyData[i] * 0.58 + target * 0.42;
+      this.frequencyData[i] = Math.max(0, Math.min(255, Math.round(this.smoothFrequencyData[i])));
     }
 
     const s = this.settings;
@@ -511,7 +515,7 @@ class BackendRenderer {
   }
 }
 
-function buildFfmpegArgs({ width, fps, duration, audioPath, outPath }) {
+function buildFfmpegArgs({ width, fps, duration, audioPath, outPath, settings }) {
   const commonPrefix = [
     "-y",
     "-hide_banner",
@@ -524,11 +528,13 @@ function buildFfmpegArgs({ width, fps, duration, audioPath, outPath }) {
     "-map", "0:v:0",
     "-map", "1:a:0"
   ];
+  const audioFilters = buildAudioFadeFilters(duration, settings);
   const commonSuffix = [
     "-pix_fmt", "yuv420p",
     "-profile:v", "high",
     "-level", width >= 2560 && fps >= 60 ? "5.2" : "4.2",
     "-movflags", "+faststart",
+    ...(audioFilters.length > 0 ? ["-af", audioFilters.join(",")] : []),
     "-c:a", "aac",
     "-b:a", "320k",
     "-shortest",
@@ -560,6 +566,18 @@ function buildFfmpegArgs({ width, fps, duration, audioPath, outPath }) {
   ];
 }
 
+function buildAudioFadeFilters(duration, settings) {
+  const filters = [];
+  const fadeIn = Math.max(0, Number(settings?.fadeIn ?? 0));
+  const fadeOut = Math.max(0, Number(settings?.fadeOut ?? 0));
+  if (fadeIn > 0) filters.push(`afade=t=in:st=0:d=${Math.min(fadeIn, duration).toFixed(3)}`);
+  if (fadeOut > 0) {
+    const safeFadeOut = Math.min(fadeOut, duration);
+    const start = Math.max(0, duration - safeFadeOut);
+    filters.push(`afade=t=out:st=${start.toFixed(3)}:d=${safeFadeOut.toFixed(3)}`);
+  }
+  return filters;
+}
 function detectBestVideoEncoder() {
   const requested = (process.env.VIDEO_ENCODER ?? "auto").toLowerCase();
   if (requested === "cpu" || requested === "libx264") return { kind: "cpu", label: "CPU libx264" };
@@ -659,6 +677,8 @@ function hexToRgba(hex, alpha) {
   const b = value & 255;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
+
+
 
 
 
