@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import fssync from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import ffmpegPath from "ffmpeg-static";
 import FFT from "fft.js";
@@ -16,9 +16,10 @@ const upload = multer({ dest: path.join(os.tmpdir(), "spectrum-studio-uploads") 
 const PORT = Number(process.env.RENDER_PORT ?? 8787);
 const SAMPLE_RATE = 44100;
 const FFT_SIZE = 2048;
+const VIDEO_ENCODER = detectBestVideoEncoder();
 
 app.use(cors({ origin: true }));
-app.get("/api/health", (_req, res) => res.json({ ok: true, renderer: "ffmpeg-backend" }));
+app.get("/api/health", (_req, res) => res.json({ ok: true, renderer: "ffmpeg-backend", videoEncoder: VIDEO_ENCODER.label }));
 const jobs = new Map();
 
 app.post("/api/render-job", upload.fields([
@@ -43,7 +44,8 @@ app.post("/api/render-job", upload.fields([
     outputPath: null,
     tmpDir: null,
     filename: null,
-    error: null
+    error: null,
+    encoder: VIDEO_ENCODER.label
   };
   jobs.set(jobId, job);
   res.json({ jobId });
@@ -67,7 +69,8 @@ app.get("/api/render-job/:jobId", (req, res) => {
     totalFrames: job.totalFrames,
     message: job.message,
     filename: job.filename,
-    error: job.error
+    error: job.error,
+    encoder: job.encoder
   });
 });
 
@@ -111,35 +114,13 @@ async function runRenderJob(job, body, audioFile, logoFile, backgroundFile) {
   const background = backgroundFile ? await loadImage(backgroundFile.path) : undefined;
   const renderer = new BackendRenderer(width, height, settings, logo, background, pcm);
 
-  const ffmpeg = spawn(ffmpegPath, [
-    "-y",
-    "-hide_banner",
-    "-loglevel", "error",
-    "-f", "image2pipe",
-    "-framerate", String(fps),
-    "-i", "pipe:0",
-    "-i", audioFile.path,
-    "-t", duration.toFixed(3),
-    "-map", "0:v:0",
-    "-map", "1:a:0",
-    "-c:v", "libx264",
-    "-preset", "medium",
-    "-crf", "18",
-    "-pix_fmt", "yuv420p",
-    "-profile:v", "high",
-    "-level", width >= 2560 && fps >= 60 ? "5.2" : "4.2",
-    "-movflags", "+faststart",
-    "-c:a", "aac",
-    "-b:a", "320k",
-    "-shortest",
-    outPath
-  ], { stdio: ["pipe", "pipe", "pipe"] });
+  const ffmpeg = spawn(ffmpegPath, buildFfmpegArgs({ width, fps, duration, audioPath: audioFile.path, outPath }), { stdio: ["pipe", "pipe", "pipe"] });
 
   let ffmpegError = "";
   ffmpeg.stderr.on("data", (chunk) => { ffmpegError += chunk.toString(); });
 
   job.status = "rendering";
-  job.message = `Rendering frame 0 / ${totalFrames}.`;
+  job.message = `Rendering frame 0 / ${totalFrames} with ${VIDEO_ENCODER.label}.`;
   for (let frame = 0; frame < totalFrames; frame += 1) {
     const time = frame / fps;
     const png = renderer.renderFrame(time, duration);
@@ -147,14 +128,14 @@ async function runRenderJob(job, body, audioFile, logoFile, backgroundFile) {
     job.frame = frame + 1;
     job.progress = 0.05 + ((frame + 1) / totalFrames) * 0.9;
     if (frame % Math.max(1, Math.floor(fps / 2)) === 0 || frame + 1 === totalFrames) {
-      job.message = `Rendering frame ${frame + 1} / ${totalFrames}.`;
+      job.message = `Rendering frame ${frame + 1} / ${totalFrames} with ${VIDEO_ENCODER.label}.`;
     }
   }
   ffmpeg.stdin.end();
 
   job.status = "encoding";
   job.progress = 0.97;
-  job.message = "Finalizing MP4.";
+  job.message = `Finalizing MP4 with ${VIDEO_ENCODER.label}.`;
   const code = await waitForExit(ffmpeg);
   if (code !== 0) throw new Error(ffmpegError || `FFmpeg exited with code ${code}`);
 
@@ -192,29 +173,7 @@ app.post("/api/render", upload.fields([
     const background = backgroundFile ? await loadImage(backgroundFile.path) : undefined;
     const renderer = new BackendRenderer(width, height, settings, logo, background, pcm);
 
-    const ffmpeg = spawn(ffmpegPath, [
-      "-y",
-      "-hide_banner",
-      "-loglevel", "error",
-      "-f", "image2pipe",
-      "-framerate", String(fps),
-      "-i", "pipe:0",
-      "-i", audioFile.path,
-      "-t", duration.toFixed(3),
-      "-map", "0:v:0",
-      "-map", "1:a:0",
-      "-c:v", "libx264",
-      "-preset", "slow",
-      "-crf", "16",
-      "-pix_fmt", "yuv420p",
-      "-profile:v", "high",
-      "-level", width >= 2560 && fps >= 60 ? "5.2" : "4.2",
-      "-movflags", "+faststart",
-      "-c:a", "aac",
-      "-b:a", "320k",
-      "-shortest",
-      outPath
-    ], { stdio: ["pipe", "pipe", "pipe"] });
+    const ffmpeg = spawn(ffmpegPath, buildFfmpegArgs({ width, fps, duration, audioPath: audioFile.path, outPath }), { stdio: ["pipe", "pipe", "pipe"] });
 
     let ffmpegError = "";
     ffmpeg.stderr.on("data", (chunk) => { ffmpegError += chunk.toString(); });
@@ -552,6 +511,77 @@ class BackendRenderer {
   }
 }
 
+function buildFfmpegArgs({ width, fps, duration, audioPath, outPath }) {
+  const commonPrefix = [
+    "-y",
+    "-hide_banner",
+    "-loglevel", "error",
+    "-f", "image2pipe",
+    "-framerate", String(fps),
+    "-i", "pipe:0",
+    "-i", audioPath,
+    "-t", duration.toFixed(3),
+    "-map", "0:v:0",
+    "-map", "1:a:0"
+  ];
+  const commonSuffix = [
+    "-pix_fmt", "yuv420p",
+    "-profile:v", "high",
+    "-level", width >= 2560 && fps >= 60 ? "5.2" : "4.2",
+    "-movflags", "+faststart",
+    "-c:a", "aac",
+    "-b:a", "320k",
+    "-shortest",
+    outPath
+  ];
+
+  if (VIDEO_ENCODER.kind === "amf") {
+    const bitrate = width >= 3840 ? "65000k" : width >= 2560 ? "36000k" : "18000k";
+    const maxrate = width >= 3840 ? "90000k" : width >= 2560 ? "52000k" : "26000k";
+    return [
+      ...commonPrefix,
+      "-c:v", "h264_amf",
+      "-quality", "quality",
+      "-usage", "transcoding",
+      "-rc", "vbr_peak",
+      "-b:v", bitrate,
+      "-maxrate", maxrate,
+      "-bufsize", maxrate,
+      ...commonSuffix
+    ];
+  }
+
+  return [
+    ...commonPrefix,
+    "-c:v", "libx264",
+    "-preset", "medium",
+    "-crf", "18",
+    ...commonSuffix
+  ];
+}
+
+function detectBestVideoEncoder() {
+  const requested = (process.env.VIDEO_ENCODER ?? "auto").toLowerCase();
+  if (requested === "cpu" || requested === "libx264") return { kind: "cpu", label: "CPU libx264" };
+  if (requested === "amf" || requested === "h264_amf") return { kind: "amf", label: "AMD GPU h264_amf (forced)" };
+
+  const encoders = spawnSync(ffmpegPath, ["-hide_banner", "-encoders"], { encoding: "utf8" });
+  const hasAmf = encoders.status === 0 && encoders.stdout.includes("h264_amf");
+  if (hasAmf) {
+    const smoke = spawnSync(ffmpegPath, [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-f", "lavfi",
+      "-i", "color=c=black:s=16x16:d=0.1",
+      "-frames:v", "1",
+      "-c:v", "h264_amf",
+      "-f", "null",
+      "-"
+    ], { encoding: "utf8" });
+    if (smoke.status === 0) return { kind: "amf", label: "AMD GPU h264_amf" };
+  }
+  return { kind: "cpu", label: "CPU libx264" };
+}
 function decodeAudio(filePath) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-i", filePath, "-f", "f32le", "-ac", "1", "-ar", String(SAMPLE_RATE), "pipe:1"], { stdio: ["ignore", "pipe", "pipe"] });
@@ -629,6 +659,8 @@ function hexToRgba(hex, alpha) {
   const b = value & 255;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
+
+
 
 
 
