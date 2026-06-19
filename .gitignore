@@ -1,0 +1,13 @@
+node_modules/
+dist/
+work/
+outputs/
+.env
+.env.local
+*.log
+*.mp4
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.ogg
